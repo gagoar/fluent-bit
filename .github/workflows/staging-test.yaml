@@ -1,0 +1,237 @@
+---
+name: Test staging
+# The intention is this workflow is triggered either manually or
+# after build has completed.
+on:
+  workflow_run:
+    workflows: ['Deploy to staging']
+    types:
+      - completed
+  workflow_dispatch:
+
+env:
+  # Containers
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  staging-test-images-cosign-verify:
+    name: Cosign verification of container image
+    if: ${{ env.COSIGN_PUBLIC_KEY }} # Only key-based verification currently
+    environment: staging
+    runs-on: [ ubuntu-latest ]
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # There is currently no way to verify a local image, e.g. for a particular architecture
+      # https://github.com/sigstore/cosign/issues/60
+      - name: Verify image with a key
+        run: |
+          echo -e "${COSIGN_PUBLIC_KEY}" > /tmp/my_cosign.pub
+          cosign verify --key /tmp/my_cosign.pub "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          rm -f /tmp/my_cosign.key
+        shell: bash
+        env:
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+
+  staging-test-images-container-architecture:
+    name: ${{ matrix.arch }} image architecture verification
+    runs-on: ubuntu-latest
+    environment: staging
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ linux/amd64, linux/arm64, linux/arm/v7 ]
+        include:
+          # Rather than extract the specific central arch we just provide it
+          - arch: linux/amd64
+            expected: amd64
+          - arch: linux/arm64
+            expected: arm64
+          - arch: linux/arm/v7
+            expected: arm
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and extract architecture of image
+        id: extract_arch
+        run: |
+          docker pull --platform=${{ matrix.arch }} "$REGISTRY/$IMAGE_NAME:latest"
+          ACTUAL_ARCH=$(docker image inspect --format '{{.Architecture}}' $REGISTRY/$IMAGE_NAME:latest)
+          echo ::set-output name=ACTUAL_ARCH::$ACTUAL_ARCH
+          docker image inspect "$REGISTRY/$IMAGE_NAME:latest"
+
+      - name: Validate architecture of image
+        run: |
+          if [[ "$ACTUAL_ARCH" != "$EXPECTED_ARCH" ]]; then
+            echo "Invalid architecture for $REGISTRY/$IMAGE_NAME: $ACTUAL_ARCH != $EXPECTED_ARCH"
+            exit 1
+          fi
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected }}
+          ACTUAL_ARCH: ${{ steps.extract_arch.outputs.ACTUAL_ARCH }}
+        shell: bash
+
+  staging-test-images-container-smoke:
+    # Ensure each architecture container runs up correctly with default configuration.
+    name: ${{ matrix.arch }} smoke test for local container images
+    runs-on: ubuntu-latest
+    environment: staging
+    # No point running if the architecture is incorrect
+    needs: [ staging-test-images-container-architecture ]
+    continue-on-error: true
+    strategy:
+      fail-fast: false # verify all
+      matrix:
+        arch: [ linux/amd64, linux/arm64, linux/arm/v7 ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU using standard action
+        if: ${{ matrix.arch != 'linux/arm64' }}
+        uses: docker/setup-qemu-action@v1
+
+      # Without this QEMU fails for ARM64
+      - name: Set up binary emulation for QEMU
+        if: ${{ matrix.arch == 'linux/arm64' }}
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: Verify platform is supported with Alpine container
+        # We make sure there is not an inherent issue with this architecture on this runner
+        run: |
+          docker run --rm --platform=${{ matrix.arch }} alpine uname -a
+
+      - name: Test the HTTP server is responding
+        timeout-minutes: 2
+        run: |
+          packaging/testing/smoke/container/container-smoke-test.sh
+        shell: bash
+        env:
+          CONTAINER_NAME: local-smoke-${{ matrix.arch }}
+          CONTAINER_ARCH: ${{ matrix.arch }}
+
+  staging-test-images-k8s-smoke:
+    # No need to test every architecture here, that is covered by local container tests.
+    # Testing helm chart deployment on KIND here.
+    name: Helm chart test on KIND
+    environment: staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Create k8s Kind Cluster
+        uses: helm/kind-action@v1.2.0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.6.3
+
+      - name: Set up Kubectl
+        uses: azure/setup-kubectl@v1
+
+      - name: Test the HTTP server is responding
+        timeout-minutes: 2
+        run: |
+          packaging/testing/smoke/k8s/k8s-smoke-test.sh
+        shell: bash
+
+  staging-test-get-version:
+    name: Get version in staging
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      stagingVersion: ${{ steps.get_version.outputs.VERSION }}
+    steps:
+      - name: Get the version
+        id: get_version
+        run: |
+          curl --fail -LO "$AWS_URL/latest-version.txt"
+          VERSION=$(cat latest-version.txt)
+          echo ::set-output name=VERSION::$VERSION
+        shell: bash
+        env:
+          AWS_URL: https://${{ secrets.AWS_S3_BUCKET_STAGING }}
+
+  staging-test-packaging:
+    # We use Dokken to run a series of test suites locally on containers representing
+    # each OS we want to install on. This creates custom images with the package
+    # installed and configured as per our documentation then verifies that the agent
+    # is running at startup.
+    name: Binary package tests
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: staging-test-get-version
+    env:
+      RELEASE_URL: https://packages.fluentbit.io
+      AWS_URL: https://${{ secrets.AWS_S3_BUCKET_STAGING }}
+    strategy:
+      fail-fast: false # Run as many tests as we can to get results in one go
+      matrix:
+        os: [ debian-10, centos-7, ubuntu-1804, ubuntu-20.04]
+        suite: [ default ]
+        # TODO: architecture tests as well
+        # arch: [ x86_64, arm64 ]
+        # TODO: exclude other os/arch combos
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Install Chef
+      uses: actionshub/chef-install@2.0.1
+
+    - name: Official package installation tests
+      # Check if official packages work
+      uses: actionshub/kitchen-dokken@1.0.1
+      env:
+        suite: ${{ matrix.suite }}
+        os: ${{ matrix.os }}
+        CHEF_LICENSE: accept-no-persist
+        KITCHEN_YAML: packaging/testing/smoke/packages/kitchen-official-install.yaml
+        # No version to test
+        # STAGING_VERSION:
+
+    - name: Staging package installation tests
+      uses: actionshub/kitchen-dokken@1.0.1
+      env:
+        suite: ${{ matrix.suite }}
+        os: ${{ matrix.os }}
+        CHEF_LICENSE: accept-no-persist # https://docs.chef.io/chef_license/
+        KITCHEN_YAML: packaging/testing/smoke/packages/kitchen-staging-install.yaml
+        STAGING_VERSION: ${{ needs.staging-test-get-version.outputs.stagingVersion }}
+
+    - name: Staging package upgrade tests
+      # Install the latest release version then upgrade to staging version.
+      # Run even if official packages fail.
+      if: always()
+      uses: actionshub/kitchen-dokken@1.0.1
+      env:
+        suite: ${{ matrix.suite }}
+        os: ${{ matrix.os }}
+        CHEF_LICENSE: accept-no-persist
+        KITCHEN_YAML:  packaging/testing/smoke/packages/kitchen-staging-upgrade.yaml
+        STAGING_VERSION: ${{ needs.staging-test-get-version.outputs.stagingVersion }}

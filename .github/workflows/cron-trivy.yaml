@@ -21,6 +21,7 @@ jobs:
     runs-on: [ ubuntu-latest ]
     continue-on-error: true
     strategy:
+      max-parallel: 4
       fail-fast: false
       # Matrix of architectures to test along with their local tags for special character substitution
       matrix:

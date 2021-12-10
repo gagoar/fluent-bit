@@ -1,0 +1,396 @@
+---
+name: Deploy to staging
+
+on:
+  push:
+    tags:
+      - '*'
+  release:
+    types: [created]
+
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit SHA to use
+        required: true
+        default: master
+
+env:
+  # Containers
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+  # Special environment for staging jobs
+  # https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
+
+  # Required secrets:
+  # GPG_PRIVATE_KEY
+  # AWS_ACCESS_KEY_ID
+  # AWS_SECRET_ACCESS_KEY
+  # AWS_S3_BUCKET_STAGING
+  # COSIGN_PRIVATE_KEY
+  # COSIGN_PASSWORD # only COSIGN_PRIVATE_KEY key requires it
+jobs:
+
+  # Unfortunately output variables do not seem to work with ACT for dependent jobs
+  # https://github.com/nektos/act/issues/909
+  # https://github.com/nektos/act/issues/826
+  deploy-get-version:
+    name: Get version to build
+    runs-on: ubuntu-latest
+    environment: staging
+    outputs:
+      releaseTag: ${{ steps.formatted_version.outputs.replaced }}
+    steps:
+      - name: Get the version
+        id: get_version
+        # Use the input variable if defined, if not attempt to get a tag
+        # Finally default it
+        run: |
+            VERSION="${INPUT_REF}"
+            if [ -z "${VERSION}" ]; then
+              if [ -z "${GITHUB_REF/refs\/tags\//}" ]; then
+                VERSION="${GITHUB_REF/refs\/tags\//}"
+              else
+                VERSION=1.8.10
+              fi
+            fi
+            echo ::set-output name=VERSION::$VERSION
+        shell: bash
+
+      - uses: frabert/replace-string-action@v2.0
+        id: formatted_version
+        with:
+          pattern: '[v]*(.*)$'
+          string: "${{ steps.get_version.outputs.VERSION }}"
+          replace-with: '$1'
+          flags: 'g'
+
+  deploy-staging-packages:
+    name: ${{ matrix.distro }} package build and stage to S3
+    environment: staging
+    runs-on: ubuntu-latest
+    needs: deploy-get-version
+
+    strategy:
+      fail-fast: true
+      matrix:
+        distro: [ amazonlinux/2, amazonlinux/2.arm64v8,
+                  centos/7, centos/7.arm64v8,
+                  debian/stretch, debian/stretch.arm64v8, debian/buster, debian/buster.arm64v8,
+                  ubuntu/16.04, ubuntu/18.04, ubuntu/20.04, ubuntu/18.04.arm64v8, ubuntu/20.04.arm64v8,
+                  raspbian/buster ]
+        include:
+          - distro: ubuntu/18.04
+            target: ubuntu/bionic
+
+          - distro: amazonlinux/2
+            target: amazonlinux/2/
+
+          - distro: amazonlinux/2.arm64v8
+            target: amazonlinux/2/
+
+          - distro: centos/7
+            target: centos/7/
+
+          - distro: centos/7.arm64v8
+            target: centos/7/
+
+          - distro: debian/stretch
+            target: debian/stretch/
+
+          - distro: debian/stretch.arm64v8
+            target: debian/stretch/
+
+          - distro: debian/buster
+            target: debian/buster/
+
+          - distro: debian/buster.arm64v8
+            target: debian/buster/
+
+          - distro: ubuntu/16.04
+            target: ubuntu/xenial/
+
+          - distro: ubuntu/18.04.arm64v8
+            target: ubuntu/bionic/
+
+          - distro: ubuntu/20.04
+            target: ubuntu/focal/
+
+          - distro: ubuntu/20.04.arm64v8
+            target: ubuntu/focal/
+
+          - distro: raspbian/buster
+            target: raspbian/buster/
+    env:
+      release: ${{ needs.deploy-get-version.outputs.releaseTag }}
+    steps:
+
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - uses: frabert/replace-string-action@master
+      id: formatted_distro
+      with:
+        pattern: '(.*)\/(.*)$'
+        string: "${{ matrix.distro }}"
+        replace-with: '$1-$2'
+        flags: 'g'
+
+    - name: Build the ${{ matrix.distro }} artifacts
+      run: |
+        ./build.sh -v "${{ env.release }}" -d "${{ matrix.distro }}"
+      env:
+        FLB_OUT_DIR: staging
+      working-directory: packaging
+
+    - name: Push packages to S3
+      # Make sure not to do a --delete on sync as it will remove the other architecture
+      run: |
+        if [ -n "${AWS_S3_ENDPOINT}" ]; then
+          ENDPOINT="--endpoint-url ${AWS_S3_ENDPOINT}"
+        fi
+        aws --region "$AWS_REGION" s3 sync "${SOURCE_DIR}" "s3://${AWS_S3_BUCKET}/${DEST_DIR}" --follow-symlinks --no-progress ${ENDPOINT}
+      env:
+        SOURCE_DIR: "packaging/packages/${{ matrix.distro }}/${{ env.release }}/staging/"
+        DEST_DIR: "${{ env.release }}/${{ matrix.target }}" # No extra slashes as they affect the URL to download
+        AWS_REGION: "us-east-1"
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET_STAGING }}
+        # To use with Minio locally (or update to whatever endpoint you want)
+        # AWS_S3_ENDPOINT: http://localhost:9000
+
+    - name: Upload the ${{ matrix.distro }} artifacts
+      if: always()
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ steps.formatted_distro.outputs.replaced }}-package
+        path: packaging/packages/
+        if-no-files-found: error
+
+  deploy-staging-packages-repo:
+    name: Create repo metadata in S3
+    runs-on: ubuntu-18.04 # no createrepo otherwise
+    needs: [ deploy-get-version, deploy-staging-packages]
+    env:
+      release: ${{ needs.deploy-get-version.outputs.releaseTag }}
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get install createrepo debsigs
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Import GPG key for signing
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v4
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Create repositories on staging now
+        # We sync down what we have for the release directories.
+        # Create the repo metadata then upload to the root of the bucket.
+        # This will wipe out any versioned directories in the process.
+        run: |
+          rm -rf ./latest/
+          mkdir -p ./latest/
+          if [ -n "${AWS_S3_ENDPOINT}" ]; then
+            ENDPOINT="--endpoint-url ${AWS_S3_ENDPOINT}"
+          fi
+          aws s3 sync "s3://$AWS_S3_BUCKET/${{ env.release }}" ./latest/ --no-progress ${ENDPOINT}
+
+          gpg --export -a "${{ steps.import_gpg.outputs.name }}" > ./latest/fluentbit.key
+          rpm --import ./latest/fluentbit.key
+
+          ./update-repos.sh "${{ env.release }}" "./latest/"
+          echo "${{ env.release }}" > "./latest/latest-version.txt"
+          aws s3 sync "./latest/" "s3://$AWS_S3_BUCKET" --delete --follow-symlinks --no-progress ${ENDPOINT}
+        env:
+          GPG_KEY: ${{ steps.import_gpg.outputs.name }}
+          AWS_REGION: "us-east-1"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET_STAGING }}
+          # To use with Minio locally (or update to whatever endpoint you want)
+          # AWS_S3_ENDPOINT: http://localhost:9000
+        shell: bash
+        working-directory: packaging
+
+  deploy-staging-images-matrix:
+    name: ${{ matrix.arch }} container image stage to GHCR
+    runs-on: [ ubuntu-latest ]
+    environment: staging
+    needs: deploy-get-version
+    env:
+      release: ${{ needs.deploy-get-version.outputs.releaseTag }}
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        arch: [ amd64, arm64, arm/v7 ]
+        include:
+          - arch: amd64
+            suffix: x86_64
+          - arch: arm/v7
+            suffix: arm32v7
+          - arch: arm64
+            suffix: arm64v8
+          # - arch: amd64
+          #   suffix: x86_64-debug
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v1
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@v1
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata from Github
+      id: meta
+      uses: docker/metadata-action@v3
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          raw,${{ matrix.suffix }}-${{ env.release }}
+          raw,${{ matrix.suffix }}-latest
+
+    - name: Build the staging image
+      uses: docker/build-push-action@v2
+      with:
+        file: ./dockerfiles/Dockerfile.${{ matrix.suffix }}
+        context: .
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        platforms: linux/${{ matrix.arch }}
+        push: true
+        load: false
+        build-args: |
+          FLB_TARBALL=https://github.com/fluent/fluent-bit/archive/v${{ needs.deploy-get-version.outputs.releaseTag }}.tar.gz
+
+  deploy-staging-scan-images:
+    name: Trivy + Dockle image scan
+    runs-on: [ ubuntu-latest ]
+    environment: staging
+    needs: [ deploy-get-version, deploy-staging-images-matrix ]
+    env:
+      release: ${{ needs.deploy-get-version.outputs.releaseTag }}
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        suffix: [ x86_64, arm32v7, arm64v8 ]
+    steps:
+      - name: Checkout code for ignore list
+        uses: actions/checkout@v2
+
+      - name: Run Trivy and Dockle scans
+        uses: azure/container-scan@v0
+        with:
+          image-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.suffix }}-${{ env.release }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+  # https://github.com/tfsaggregator/aggregator-cli/blob/master/.github/workflows/build-and-deploy.yml
+  deploy-staging-images:
+    name: Deploy and sign multi-arch container image manifests
+    permissions:
+      contents: read
+      packages: write
+      # This is used to complete the identity challenge
+      # with sigstore/fulcio when running outside of PRs.
+      id-token: write
+    runs-on: [ ubuntu-latest ]
+    environment: staging
+    needs: [ deploy-get-version, deploy-staging-images-matrix ]
+    env:
+      release: ${{ needs.deploy-get-version.outputs.releaseTag }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull all the images
+        # Use platform to trigger warnings on invalid image metadata
+        run: |
+          docker pull --platform=linux/amd64 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64-${{ env.release }}
+          docker pull --platform=linux/arm64 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64v8-${{ env.release }}
+          docker pull --platform=linux/arm/v7  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm32v7-${{ env.release }}
+
+      - name: Create manifests for images
+        run: |
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.release }} \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64-${{ env.release }} \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64v8-${{ env.release }} \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm32v7-${{ env.release }}
+
+          docker manifest create ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:x86_64-${{ env.release }} \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm64v8-${{ env.release }} \
+            --amend ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:arm32v7-${{ env.release }}
+
+          docker manifest push --purge ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.release }}
+          docker manifest push --purge ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@main
+
+      - name: Cosign keyless signing using Rektor public transparency log
+        # This step uses the identity token to provision an ephemeral certificate
+        # against the sigstore community Fulcio instance, and records it to the
+        # sigstore community Rekor transparency log.
+        #
+        # We use recursive signing on the manifest to cover all the images.
+        run: |
+          cosign sign --recursive \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ github.sha }}" \
+            -a "release=${{ env.release }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.release }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        shell: bash
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      - name: Cosign with a key
+        # Only run if we have a key defined
+        if: ${{ env.COSIGN_PRIVATE_KEY }}
+        # The key needs to cope with newlines
+        run: |
+          echo -e "${COSIGN_PRIVATE_KEY}" > /tmp/my_cosign.key
+          cosign sign --key /tmp/my_cosign.key --recursive \
+            -a "repo=${{ github.repository }}" \
+            -a "workflow=${{ github.workflow }}" \
+            -a "ref=${{ github.sha }}" \
+            -a "release=${{ env.release }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.release }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          rm -f /tmp/my_cosign.key
+        shell: bash
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }} # optional

@@ -3,8 +3,9 @@
 
 | Workflow file                                         | Description               | Run event                                         |
 | :---------------------------------------------------- | ------------------------  | ------------------------------------------------- |
-| [build-release](./build-release.yaml)            | Builds the distro packages and docker images from a tagged release| on new release/tag|
-| [publish-release](./publish-release.yaml)        | Publishes the docker images/manifest on hub.docker.io/fluent/ and the distro packages | on new release/tag on build-release completes|
+| [staging-build](./staging-build.yaml)            | Builds the distro packages and docker images from a tagged release| on new release/tag|
+| [staging-test](./staging-test.yaml)            | Tests the output of the staging build| on staging-build completion|
+| [release-publish](./release-publish.yaml)        | Publishes the docker images/manifest on hub.docker.io/fluent/ and the distro packages | on new release/tag on build-release completes|
 | [pr-closed-docker](./pr-closed-docker.yaml)      | Removes docker images for PR on hub.docker.io/fluentbitdev/| on pr closed|
 | [pr-compile-check](./pr-compile-check.yaml)      | Runs some compilation sanity checks on a PR |
 | [pr-stale](./pr-stale.yaml)                      | Closes stale PR(s) with no activity in 30 days | scheduled daily 01:30 AM UTC|
